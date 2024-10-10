@@ -34,6 +34,8 @@
  *                      applied to UTC (or local time if RotateLogsLocalTime
  *                      is on). For example RotateInterval 86400 60 will
  *                      cause logs to be rotated at 23:00 UTC.
+ *                      If the interval is set to 0, the log will not be written at
+ *                      all, similar like routating to /dev/null
  *
  * The current version of this module is available at:
  *   http://www.hexten.net/sw/mod_log_rotate/index.mhtml
@@ -42,6 +44,7 @@
 /* 2004/12/02 1.00      andya@apache.org    Initial release.
  * 2015/20/02 1.01      leet31137@web.de    Updated Vesion with signature
  * 2016/05/05 1.02      leet31337@web.de    Enabled debug logic for debugging
+ * 2024/10/10 1.03      sunnyqeen@gmail.com Enabled rotating to null if the interval is 0
  */
 #include "apr_anylock.h"
 #include "apr_file_io.h"
@@ -182,6 +185,11 @@ static apr_status_t ap_close_log(server_rec *s, apr_file_t *fd) {
  */
 static apr_time_t ap_get_quantized_time(rotated_log *rl, apr_time_t tm) {
     apr_time_t localadj = 0;
+    apr_time_t interval = rl->st.interval;
+
+    if (interval <= 0) {
+        interval = 1;
+    }
 
     if (rl->st.localt) {
         apr_time_exp_t lt;
@@ -189,7 +197,7 @@ static apr_time_t ap_get_quantized_time(rotated_log *rl, apr_time_t tm) {
         localadj = (apr_time_t) lt.tm_gmtoff * APR_USEC_PER_SEC;
     }
 
-    return ((tm + rl->st.offset + localadj) / rl->st.interval) * rl->st.interval;
+    return ((tm + rl->st.offset + localadj) / interval) * interval;
 }
 
 /* Called by mod_log_config to write a log file line.
@@ -203,7 +211,7 @@ static apr_status_t ap_rotated_log_writer(request_rec *r, void *handle,
     apr_status_t rv = 0;
     rotated_log *rl = (rotated_log *) handle;
 
-    if (NULL != rl && NULL != rl->fd) {
+    if (NULL != rl && NULL != rl->fd && !(rl->st.enabled && rl->st.interval <= 0)) {
         if (rl->st.enabled) {
             apr_time_t logt = ap_get_quantized_time(rl, r->request_time);
             ap_log_error(APLOG_MARK, APLOG_DEBUG, rv, r->server, "New: %lu, old: %lu",
@@ -312,8 +320,10 @@ static void *ap_rotated_log_writer_init(apr_pool_t *p, server_rec *s, const char
     rl->st      = *ls;
     rl->logtime = ap_get_quantized_time(rl, apr_time_now());
 
-    if (rl->fd = ap_open_log(rl->pool, s, rl->fname, &rl->st, rl->logtime), NULL == rl->fd) {
-        return NULL;
+    if (!rl->st.enabled || rl->st.interval > 0) {
+        if (rl->fd = ap_open_log(rl->pool, s, rl->fname, &rl->st, rl->logtime), NULL == rl->fd) {
+            return NULL;
+        }
     }
 
     return rl;
@@ -364,7 +374,7 @@ static const char *set_interval(cmd_parms *cmd, void *dummy,
     if (NULL != inte) {
         /* Interval in seconds */
         ls->interval = APR_USEC_PER_SEC * (apr_time_t) atol(inte);
-        if (ls->interval < INTERVAL_MIN) {
+        if (ls->interval > 0 && ls->interval < INTERVAL_MIN) {
             ls->interval = INTERVAL_MIN;
         }
     }
@@ -412,7 +422,7 @@ static void *merge_log_options(apr_pool_t *p, void *basev, void *addv) {
 /* map into the first apache */
 static int log_rotate_post_config( apr_pool_t * p, apr_pool_t * plog, apr_pool_t * ptemp, server_rec * s)
 {
-	ap_add_version_component(p, "mod_log_rotate/1.02");
+	ap_add_version_component(p, "mod_log_rotate/1.03");
 	return OK;
 }
 

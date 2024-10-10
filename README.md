@@ -55,6 +55,8 @@ CustomLog logs/%Y%m%d-%H%M%S.access.log common
 						applied to UTC (or local time if RotateLogsLocalTime
 						is on). For example RotateInterval 86400 60 will
 						cause logs to be rotated at 23:00 UTC.
+						If the interval is set to 0, the log will not be written at
+						all, similar like routating to /dev/null
 
 ## Bugs
 
