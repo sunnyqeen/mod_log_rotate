@@ -37,6 +37,13 @@
  *                      If the interval is set to 0, the log will not be written at
  *                      all, similar like routating to /dev/null
  *
+ *                      If the interval option is set to KB/MB/GB, the log will base
+ *                      on size, the log name will base on 10 seconds. For example
+ *                      RotateInterval 100 MB will casue logs to be rotated when
+ *                      100MB data is writen. The logfile size will be equal or
+ *                      less than 100 MB
+ *
+ *
  * The current version of this module is available at:
  *   http://www.hexten.net/sw/mod_log_rotate/index.mhtml
  */
@@ -45,6 +52,7 @@
  * 2015/20/02 1.01      leet31137@web.de    Updated Vesion with signature
  * 2016/05/05 1.02      leet31337@web.de    Enabled debug logic for debugging
  * 2024/10/10 1.03      sunnyqeen@gmail.com Enabled rotating to null if the interval is 0
+ * 2024/10/12 1.04      sunnyqeen@gmail.com Added size based rotation
  */
 #include "apr_anylock.h"
 #include "apr_file_io.h"
@@ -65,6 +73,14 @@
 
 #define INTERVAL_DEFAULT    (APR_USEC_PER_SEC * APR_TIME_C(3600) * APR_TIME_C(24))
 #define INTERVAL_MIN        (APR_USEC_PER_SEC * APR_TIME_C(60))
+#define TIMESTAMP_MIN       (APR_USEC_PER_SEC * APR_TIME_C(10))
+
+enum {
+    OPT_TIME,
+    OPT_SIZE_KB = 1024,
+    OPT_SIZE_MB = 1024 * 1024,
+    OPT_SIZE_GB = 1024 * 1024 * 1024
+};
 
 static int xfer_flags = (APR_WRITE | APR_APPEND | APR_CREATE | APR_LARGEFILE);
 static apr_fileperms_t xfer_perms = APR_OS_DEFAULT;
@@ -76,6 +92,7 @@ typedef struct {
     apr_time_t      interval;       /* Rotation interval                    */
     apr_time_t      offset;         /* Offset from midnight                 */
     int             localt;         /* Use local time instead of GMT        */
+    int             option;         /* time or size based rotate            */
 } log_options;
 
 typedef struct {
@@ -83,6 +100,7 @@ typedef struct {
     const char      *fname;         /* Basename for logs without extension  */
     apr_file_t      *fd;            /* Current open log file                */
     apr_time_t      logtime;        /* Quantised time of current log file   */
+    apr_int64_t     logsize;        /* current log file size                */
     apr_anylock_t   mutex;
 
     log_options     st;             /* Embedded config options              */
@@ -187,8 +205,8 @@ static apr_time_t ap_get_quantized_time(rotated_log *rl, apr_time_t tm) {
     apr_time_t localadj = 0;
     apr_time_t interval = rl->st.interval;
 
-    if (interval <= 0) {
-        interval = 1;
+    if (interval <= 0 || rl->st.option != OPT_TIME) {
+        interval = TIMESTAMP_MIN;
     }
 
     if (rl->st.localt) {
@@ -198,6 +216,14 @@ static apr_time_t ap_get_quantized_time(rotated_log *rl, apr_time_t tm) {
     }
 
     return ((tm + rl->st.offset + localadj) / interval) * interval;
+}
+
+static int ap_rotated_check(rotated_log *rl, apr_time_t logt, apr_size_t len) {
+    if (rl->st.option == OPT_TIME) {
+        return logt != rl->logtime;
+    } else {
+        return rl->logsize + (apr_int64_t)len > rl->st.interval * rl->st.option;
+    }
 }
 
 /* Called by mod_log_config to write a log file line.
@@ -217,7 +243,7 @@ static apr_status_t ap_rotated_log_writer(request_rec *r, void *handle,
             ap_log_error(APLOG_MARK, APLOG_DEBUG, rv, r->server, "New: %lu, old: %lu",
             (unsigned long) logt, (unsigned long) rl->logtime);
             /* Decide if the quantized time has rolled over into a new slot. */
-            if (logt != rl->logtime) {
+            if (ap_rotated_check(rl, logt, len)) {
                 /* Get the mutex */
                 if (rv = APR_ANYLOCK_LOCK(&rl->mutex), APR_SUCCESS != rv) {
                     return rv;
@@ -226,7 +252,7 @@ static apr_status_t ap_rotated_log_writer(request_rec *r, void *handle,
                 /* Now check again in case someone else rotated the log while we waited
                  * for the mutex.
                  */
-                if (logt != rl->logtime) {
+                if (ap_rotated_check(rl, logt, len)) {
                     apr_file_t *ofd = rl->fd;
                     apr_pool_t *par, *np;
                     rl->logtime = logt;
@@ -256,6 +282,8 @@ static apr_status_t ap_rotated_log_writer(request_rec *r, void *handle,
                         /* ...and switch to the new pool. */
                         apr_pool_destroy(rl->pool);
                         rl->pool = np;
+                        /* ... and reset logsize */
+                        rl->logsize = 0;
                     }
                 }
 
@@ -271,6 +299,7 @@ static apr_status_t ap_rotated_log_writer(request_rec *r, void *handle,
         }
 
         rv = apr_file_write(rl->fd, str, &len);
+        rl->logsize += len;
 
         return rv;
     }
@@ -287,7 +316,7 @@ static void *ap_rotated_log_writer_init(apr_pool_t *p, server_rec *s, const char
     apr_status_t rv;
     log_options *ls = ap_get_module_config(s->module_config, &log_rotate_module);
 
-    rl = apr_palloc(p, sizeof(rotated_log));
+    rl = apr_pcalloc(p, sizeof(rotated_log));
     rl->fname = apr_pstrdup(p, name);
 
     if (rv = apr_pool_create(&rl->pool, p), APR_SUCCESS != rv) {
@@ -371,15 +400,31 @@ static const char *set_localtime(cmd_parms *cmd, void *dummy, int flag) {
 static const char *set_interval(cmd_parms *cmd, void *dummy,
                                 const char *inte, const char *offs) {
     log_options *ls = ap_get_module_config(cmd->server->module_config, &log_rotate_module);
-    if (NULL != inte) {
-        /* Interval in seconds */
-        ls->interval = APR_USEC_PER_SEC * (apr_time_t) atol(inte);
-        if (ls->interval > 0 && ls->interval < INTERVAL_MIN) {
-            ls->interval = INTERVAL_MIN;
+
+    if (NULL != offs) {
+        if (strcmp(offs, "KB") == 0) {
+            ls->option = OPT_SIZE_KB;
+        } else if (strcmp(offs, "MB") == 0) {
+            ls->option = OPT_SIZE_MB;
+        } else if (strcmp(offs, "GB") == 0) {
+            ls->option = OPT_SIZE_GB;
         }
     }
 
-    if (NULL != offs) {
+    if (NULL != inte) {
+        if (ls->option == OPT_TIME) {
+            /* Interval in seconds */
+            ls->interval = APR_USEC_PER_SEC * (apr_time_t) atol(inte);
+            if (ls->interval > 0 && ls->interval < INTERVAL_MIN) {
+                ls->interval = INTERVAL_MIN;
+            }
+        } else {
+            /* Interval in size KB/MB/GB */
+            ls->interval = atol(inte);
+        }
+    }
+
+    if (NULL != offs && ls->option == OPT_TIME) {
         /* Offset in minutes */
         ls->offset = APR_USEC_PER_SEC * 60 * (apr_time_t) atol(offs);
     }
@@ -394,7 +439,8 @@ static const command_rec rotate_log_cmds[] = {
                    "Rotate relative to local time"),
     AP_INIT_TAKE12("RotateInterval", set_interval, NULL, RSRC_CONF,
                    "Set rotation interval in seconds with"
-                   " optional offset in minutes"),
+                   " optional offset in minutes"
+                   " or set rotation interval in size with KB/MB/GB"),
     {NULL}
 };
 
@@ -406,6 +452,7 @@ static void *make_log_options(apr_pool_t *p, server_rec *s) {
     ls->interval    = INTERVAL_DEFAULT;
     ls->offset      = 0;
     ls->localt      = 0;
+    ls->option      = OPT_TIME;
 
     return ls;
 }
@@ -422,7 +469,7 @@ static void *merge_log_options(apr_pool_t *p, void *basev, void *addv) {
 /* map into the first apache */
 static int log_rotate_post_config( apr_pool_t * p, apr_pool_t * plog, apr_pool_t * ptemp, server_rec * s)
 {
-	ap_add_version_component(p, "mod_log_rotate/1.03");
+	ap_add_version_component(p, "mod_log_rotate/1.04");
 	return OK;
 }
 

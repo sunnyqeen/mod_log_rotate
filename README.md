@@ -27,6 +27,9 @@ See [build.md](build.md)
 ```
 LoadModule log_rotate_module modules/mod_log_rotate.so
 RotateLogs On
+#RotateInterval 86400
+#RotateInterval 100 MB
+
 ```
 
 You can specify a strftime() format string as the log file name.
@@ -56,7 +59,13 @@ CustomLog logs/%Y%m%d-%H%M%S.access.log common
 						is on). For example RotateInterval 86400 60 will
 						cause logs to be rotated at 23:00 UTC.
 						If the interval is set to 0, the log will not be written at
-						all, similar like routating to /dev/null
+						all, similar like routating to /dev/null.
+
+						If the interval option is set to KB/MB/GB, the log will base
+ 						on size, the log name will base on 10 seconds. For example
+						RotateInterval 100 MB will casue logs to be rotated when
+						100MB data is writen. The logfile size will be equal or
+						less than 100 MB.
 
 ## Bugs
 
@@ -75,6 +84,7 @@ is no longer available.
 
 ### AVAILABILITY of the modified version
 
+https://github.com/sunnyqeen/mod_log_rotate
 https://github.com/JBlond/mod_log_rotate
 
 ### AVAILABILITY Windows binary x86 and x64
