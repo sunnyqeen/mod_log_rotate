@@ -85,6 +85,7 @@ is no longer available.
 ### AVAILABILITY of the modified version
 
 https://github.com/sunnyqeen/mod_log_rotate
+
 https://github.com/JBlond/mod_log_rotate
 
 ### AVAILABILITY Windows binary x86 and x64
